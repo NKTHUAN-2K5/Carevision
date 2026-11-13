@@ -5,10 +5,20 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <AudioFileSourceHTTPStream.h>
+#include "tts_source.h"
 #include <AudioGeneratorMP3.h>
 #include <AudioOutputI2S.h>
 #include <driver/i2s.h>
+#include <WiFiClientSecure.h>
+#include <Preferences.h>
+#include <BLEDevice.h>
+#include <BLESecurity.h>
+#include <cJSON.h>
+#include <time.h>
+#include <freertos/semphr.h>
+#include "web_ui.h"
+#include "google_ca.h"
+#include "gemini_stream.h"
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -44,8 +54,9 @@
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 WebServer server(80);
 AudioGeneratorMP3 *audioMp3 = nullptr;
-AudioFileSourceHTTPStream *audioFile = nullptr;
+TtsSource *audioFile = nullptr;
 AudioOutputI2S *audioOutput = nullptr;
+SemaphoreHandle_t speechMutex = nullptr;
 String pendingSpeech;
 volatile bool speechPending = false;
 
@@ -60,9 +71,34 @@ String lastMessage = "Xin chao!";
 String lastReply = "Minh dang nghe ban.";
 unsigned long lastBlink = 0;
 bool eyesOpen = true;
-unsigned long lastMicrophoneCheck = 0;
 
 void handleChat(const String &message);
+String makeReply(String message);
+bool microphoneReady = false;
+bool oledReady = false;
+bool autoListen = true;
+bool voiceRecording = false;
+bool audioBusy = false;
+String speakerStatus = "idle";
+uint32_t speakerBytes = 0;
+uint32_t lastVoiceRequest = 0;
+void pollVoice();
+Preferences preferences;
+String geminiKey, asrEndpoint, lastError, csrfToken, setupPassword;
+String savedSsid, savedPassword;
+uint32_t setupUntil = 0;
+bool bleStarted = false;
+QueueHandle_t configQueue = nullptr;
+struct WifiCommand { char ssid[33]; char password[64]; };
+bool wifiChanging = false;
+uint32_t wifiStarted = 0;
+WifiCommand candidate = {};
+bool setupOpen() { return setupUntil && static_cast<int32_t>(setupUntil - millis()) > 0; }
+void openSetup();
+void setupConnections();
+void pollConnections();
+bool askGemini(const String &text, const uint8_t *pcm = nullptr, size_t pcmSize = 0);
+void queueSpeech(const String &text);
 
 String urlEncode(const String &value) {
     const char hex[] = "0123456789ABCDEF";
@@ -110,7 +146,16 @@ String htmlEscape(const String &value) {
     return escaped;
 }
 
+bool stopSpeechRequested = false;
+SemaphoreHandle_t stoppedSignal = nullptr;
+
 void stopSpeaking() {
+    if (audioFile) {
+        xSemaphoreTake(speechMutex, portMAX_DELAY);
+        speakerBytes = audioFile->getPos();
+        xSemaphoreGive(speechMutex);
+        Serial.printf("TTS: ket thuc, da doc %u byte\n", speakerBytes);
+    }
     if (audioMp3 != nullptr) {
         // AudioGeneratorMP3::stop() releases decoder buffers, and its
         // destructor releases them again in ESP8266Audio 1.9.x.
@@ -133,14 +178,24 @@ void speakText(const String &text) {
         "http://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=vi&q=" +
         urlEncode(text);
     Serial.println("Dang tai am thanh TTS...");
-    audioFile = new AudioFileSourceHTTPStream(url.c_str());
+    xSemaphoreTake(speechMutex, portMAX_DELAY);
+    speakerStatus = "loading"; speakerBytes = 0;
+    xSemaphoreGive(speechMutex);
+    audioFile = new TtsSource(url.c_str());
+    if (!audioFile->isOpen()) {
+        xSemaphoreTake(speechMutex, portMAX_DELAY); speakerStatus = "download-failed"; xSemaphoreGive(speechMutex);
+        stopSpeaking(); return;
+    }
     audioOutput = new AudioOutputI2S();
     audioOutput->SetPinout(SPEAKER_BCLK, SPEAKER_LRC, SPEAKER_DIN);
     audioOutput->SetGain(0.65);
     audioMp3 = new AudioGeneratorMP3();
     if (!audioMp3->begin(audioFile, audioOutput)) {
+        xSemaphoreTake(speechMutex, portMAX_DELAY); speakerStatus = "decoder-failed"; xSemaphoreGive(speechMutex);
         Serial.println("Khong the bat dau phat MP3 qua MAX98357A.");
         stopSpeaking();
+    } else {
+        xSemaphoreTake(speechMutex, portMAX_DELAY); speakerStatus = "playing"; xSemaphoreGive(speechMutex);
     }
 }
 
@@ -189,6 +244,7 @@ void testSpeaker() {
 }
 
 void checkMicrophoneLevel() {
+    if (!microphoneReady) { lastError = "Mic chua san sang"; return; }
     int32_t samples[512];
     size_t bytesRead = 0;
     if (i2s_read(MIC_I2S_PORT, samples, sizeof(samples), &bytesRead,
@@ -197,68 +253,103 @@ void checkMicrophoneLevel() {
         Serial.println("MIC TEST: khong doc duoc mau INMP441.");
         return;
     }
-    int32_t peak = 0;
+    int32_t peakLeft = 0;
+    int32_t peakRight = 0;
     const size_t sampleCount = bytesRead / sizeof(samples[0]);
-    for (size_t i = 0; i < sampleCount; i++) {
-        // INMP441 is configured for the single LEFT slot.
-        const int32_t value = samples[i] < 0 ? -samples[i] : samples[i];
-        if (value > peak) {
-            peak = value;
-        }
+    for (size_t i = 0; i + 1 < sampleCount; i += 2) {
+        const int32_t left = samples[i] >> 12;
+        const int32_t right = samples[i + 1] >> 12;
+        const int32_t absLeft = left < 0 ? -left : left;
+        const int32_t absRight = right < 0 ? -right : right;
+        if (absLeft > peakLeft) peakLeft = absLeft;
+        if (absRight > peakRight) peakRight = absRight;
     }
-    Serial.printf("MIC TEST: muc dinh = %ld (hay noi gan mic de thay gia tri thay doi).\n",
-                  static_cast<long>(peak));
+    Serial.printf("MIC TEST: peak L=%ld, R=%ld (neu 1 kenh = 0 la dung chan L/R).\n",
+                  static_cast<long>(peakLeft), static_cast<long>(peakRight));
 }
 
 void transcribeMicrophone() {
-    if (WiFi.status() != WL_CONNECTED || String(ASR_SERVER_URL).length() == 0) {
+    if (!microphoneReady) { lastError = "Mic chua san sang"; return; }
+    if (WiFi.status() != WL_CONNECTED || (geminiKey.isEmpty() && asrEndpoint.isEmpty())) {
+        lastError = "Can WiFi va Gemini key hoac server ASR";
         Serial.println("MIC ASR: chua cau hinh ASR_SERVER_URL hoac WiFi.");
         return;
     }
 
-    constexpr size_t durationMs = 3000;
+    xSemaphoreTake(speechMutex, portMAX_DELAY);
+    speechPending = false;
+    bool needStop = audioBusy;
+    xSemaphoreTake(stoppedSignal, 0);
+    stopSpeechRequested = needStop;
+    xSemaphoreGive(speechMutex);
+    if (needStop && xSemaphoreTake(stoppedSignal, pdMS_TO_TICKS(20000)) != pdTRUE) {
+        lastError = "Khong dung duoc loa de thu am"; return;
+    }
+    constexpr size_t durationMs = 2000;
     constexpr size_t sampleRate = 16000;
     constexpr size_t sampleCount = sampleRate * durationMs / 1000;
     constexpr size_t payloadSize = sampleCount * sizeof(int16_t);
-    auto *payload = static_cast<uint8_t *>(malloc(payloadSize));
+    auto *payload = static_cast<uint8_t *>(malloc(payloadSize / 2));
     if (payload == nullptr) {
+        lastError = "Khong du RAM ghi am; dong che do BLE va thu lai";
         Serial.println("MIC ASR: khong du bo nho de ghi am.");
         return;
     }
 
-    Serial.println("MIC ASR: dang ghi am 3 giay...");
+    i2s_zero_dma_buffer(MIC_I2S_PORT);
+    Serial.println("MIC ASR: dang ghi am 2 giay...");
     size_t writtenSamples = 0;
     int32_t input[256];
+    // Flush stale DMA buffer frames before recording
+    for (int flush = 0; flush < 4; flush++) {
+        size_t flushed = 0;
+        i2s_read(MIC_I2S_PORT, input, sizeof(input), &flushed, pdMS_TO_TICKS(50));
+    }
+
+    int32_t maxPeak = 0;
     while (writtenSamples < sampleCount) {
         size_t bytesRead = 0;
         if (i2s_read(MIC_I2S_PORT, input, sizeof(input), &bytesRead,
                      pdMS_TO_TICKS(200)) != ESP_OK ||
             bytesRead == 0) {
             Serial.println("MIC ASR: loi doc INMP441.");
+            lastError = "Loi doc INMP441";
             free(payload);
             return;
         }
         const size_t inputSamples = bytesRead / sizeof(input[0]);
-        for (size_t i = 0; i < inputSamples && writtenSamples < sampleCount;
-             i++) {
-            const int32_t sample = input[i] >> 14;
+        for (size_t i = 0; i + 1 < inputSamples && writtenSamples < sampleCount;
+             i += 2) {
+            // Read active stereo slot (works whether L/R pin is tied to GND or 3V3)
+            const int32_t raw = (input[i] != 0) ? input[i] : input[i + 1];
+            const int32_t sample = raw >> 16; // Unity PCM16 gain, avoid saturating speech.
+            const int32_t absVal = sample < 0 ? -sample : sample;
+            if (absVal > maxPeak) maxPeak = absVal;
             const int16_t clipped = static_cast<int16_t>(
                 constrain(sample, -32768L, 32767L));
-            memcpy(payload + writtenSamples * sizeof(clipped), &clipped,
-                   sizeof(clipped));
+            if (writtenSamples % 2 == 0)
+                memcpy(payload + (writtenSamples / 2) * sizeof(clipped), &clipped, sizeof(clipped));
             writtenSamples++;
         }
+    }
+    Serial.printf("MIC ASR: thu xong (%u mau, bien do dinh = %ld).\n",
+                  static_cast<unsigned>(writtenSamples), static_cast<long>(maxPeak));
+
+    if (!geminiKey.isEmpty()) {
+        askGemini("", payload, payloadSize / 2);
+        free(payload);
+        return;
     }
 
     HTTPClient client;
     client.setTimeout(15000);
-    if (!client.begin(ASR_SERVER_URL)) {
+    if (!client.begin(asrEndpoint)) {
         Serial.println("MIC ASR: endpoint khong hop le.");
         free(payload);
         return;
     }
-    client.addHeader("Content-Type", "audio/pcm;rate=16000");
-    const int status = client.POST(payload, payloadSize);
+    client.addHeader("Content-Type", "audio/pcm;rate=8000");
+    const int status = client.POST(payload, payloadSize / 2);
     free(payload);
     if (status <= 0) {
         Serial.printf("MIC ASR: khong gui duoc audio (%s).\n",
@@ -268,30 +359,90 @@ void transcribeMicrophone() {
     }
     const String response = client.getString();
     client.end();
-    const int textStart = response.indexOf("\"text\":\"");
-    if (textStart < 0) {
+    const int keyPos = response.indexOf("\"text\"");
+    const int colonPos = keyPos >= 0 ? response.indexOf(':', keyPos + 6) : -1;
+    const int openQuote = colonPos >= 0 ? response.indexOf('"', colonPos + 1) : -1;
+    if (openQuote < 0) {
         Serial.println("MIC ASR: server khong tra ve van ban: " + response);
         return;
     }
-    const int valueStart = textStart + 8;
-    const int valueEnd = response.indexOf('"', valueStart);
-    if (valueEnd <= valueStart) {
+    const int valueStart = openQuote + 1;
+    int valueEnd = valueStart;
+    while (valueEnd < static_cast<int>(response.length())) {
+        if (response[valueEnd] == '"' && response[valueEnd - 1] != '\\') {
+            break;
+        }
+        valueEnd++;
+    }
+    if (valueEnd <= valueStart || valueEnd >= static_cast<int>(response.length())) {
         Serial.println("MIC ASR: phan hoi khong hop le.");
         return;
     }
-    handleChat(response.substring(valueStart, valueEnd));
+    const String text = response.substring(valueStart, valueEnd);
+    const int replyStart = response.indexOf("\"reply\"");
+    const int replyColon = replyStart >= 0 ? response.indexOf(':', replyStart + 7) : -1;
+    const int replyQuote = replyColon >= 0 ? response.indexOf('"', replyColon + 1) : -1;
+    if (replyQuote >= 0) {
+        int replyEnd = replyQuote + 1;
+        while (replyEnd < static_cast<int>(response.length())) {
+            if (response[replyEnd] == '"' && response[replyEnd - 1] != '\\') {
+                break;
+            }
+            replyEnd++;
+        }
+        if (replyEnd > replyQuote + 1 && replyEnd < static_cast<int>(response.length())) {
+            const String aiReply = response.substring(replyQuote + 1, replyEnd);
+            makeReply(aiReply);
+            lastMessage = text;
+            int closeBracket = aiReply.indexOf(']');
+            lastReply = (aiReply.startsWith("[cam_xuc:") && closeBracket > 0)
+                            ? aiReply.substring(closeBracket + 1)
+                            : aiReply;
+            lastReply.trim();
+            Serial.println("Ban: " + lastMessage);
+            Serial.println("ESP32 (AI): " + lastReply);
+            xSemaphoreTake(speechMutex, portMAX_DELAY);
+            pendingSpeech = lastReply;
+            speechPending = true;
+            xSemaphoreGive(speechMutex);
+            return;
+        }
+    }
+    handleChat(text);
 }
 
 void audioPlaybackTask(void *) {
     while (true) {
+        String text;
+        bool hasSpeech = false;
+        bool doStop = false;
+        xSemaphoreTake(speechMutex, portMAX_DELAY);
+        if (stopSpeechRequested) {
+            stopSpeechRequested = false;
+            doStop = true;
+        }
         if (speechPending) {
-            const String text = pendingSpeech;
+            text = pendingSpeech;
             speechPending = false;
+            hasSpeech = true;
+            audioBusy = true;
+        }
+        xSemaphoreGive(speechMutex);
+        if (doStop) {
+            stopSpeaking();
+            xSemaphoreTake(speechMutex, portMAX_DELAY); audioBusy = false; speakerStatus = "stopped"; xSemaphoreGive(speechMutex);
+            xSemaphoreGive(stoppedSignal);
+            Serial.println("TTS: da dung loa");
+        }
+        if (hasSpeech) {
+            xSemaphoreTake(speechMutex, portMAX_DELAY); audioBusy = true; xSemaphoreGive(speechMutex);
             speakText(text);
         }
         if (audioMp3 != nullptr && !audioMp3->loop()) {
             stopSpeaking();
+            xSemaphoreTake(speechMutex, portMAX_DELAY); speakerStatus = speakerBytes ? "finished" : "no-audio"; xSemaphoreGive(speechMutex);
         }
+        xSemaphoreTake(speechMutex, portMAX_DELAY); audioBusy = audioMp3 != nullptr; xSemaphoreGive(speechMutex);
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
@@ -301,10 +452,12 @@ void setupMicrophone() {
         .mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_RX),
         .sample_rate = 16000,
         .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
-        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+        // Use RIGHT_LEFT stereo on legacy ESP32 I2S driver to avoid the
+        // channel-swap bug where ONLY_LEFT actually captures the RIGHT slot.
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
         .communication_format = I2S_COMM_FORMAT_STAND_I2S,
         .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 4,
+        .dma_buf_count = 6,
         .dma_buf_len = 256,
         .use_apll = false,
         .tx_desc_auto_clear = false,
@@ -327,6 +480,7 @@ void setupMicrophone() {
         return;
     }
     Serial.println("INMP441 da san sang (P4/P5/P18).");
+    microphoneReady = true;
 }
 
 uint8_t findOledAddress() {
@@ -341,6 +495,7 @@ uint8_t findOledAddress() {
 }
 
 void drawFace() {
+    if (!oledReady) return;
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
 
@@ -642,11 +797,6 @@ String makeReply(String message) {
         setFace(Face::Thinking);
         return "Minh dang suy nghi cung ban.";
     }
-    if (message.indexOf("binh thuong") >= 0 ||
-        message.indexOf("tro lai") >= 0) {
-        setFace(Face::Neutral);
-        return "Minh da tro lai binh thuong.";
-    }
     if (message.indexOf("xin chao") >= 0 || message.indexOf("hello") >= 0 ||
         message.indexOf("hi") >= 0) {
         setFace(Face::Happy);
@@ -656,21 +806,9 @@ String makeReply(String message) {
         setFace(Face::Happy);
         return "Khong co gi. Minh luon san sang giup ban.";
     }
-    if (message.indexOf("yeu") >= 0 || message.indexOf("thich") >= 0) {
+    if (message.indexOf("thich") >= 0) {
         setFace(Face::Love);
         return "Minh cung rat quy ban!";
-    }
-    if (message.indexOf("gian") >= 0 || message.indexOf("tuc") >= 0) {
-        setFace(Face::Angry);
-        return "Minh hieu. Chung ta cung binh tinh nhe.";
-    }
-    if (message.indexOf("wow") >= 0 || message.indexOf("ngac nhien") >= 0) {
-        setFace(Face::Surprised);
-        return "Wow! That la bat ngo!";
-    }
-    if (message.indexOf("buon") >= 0 || message.indexOf("met") >= 0) {
-        setFace(Face::Sad);
-        return "Minh tiec vi ban dang khong vui. Hay nghi ngoi mot chut nhe.";
     }
     if (message.indexOf("ban la ai") >= 0 || message.indexOf("ten") >= 0) {
         setFace(Face::Happy);
@@ -685,10 +823,13 @@ void handleChat(const String &message) {
     lastReply = makeReply(message);
     Serial.println("Ban: " + lastMessage);
     Serial.println("ESP32: " + lastReply);
+    xSemaphoreTake(speechMutex, portMAX_DELAY);
     pendingSpeech = lastReply;
     speechPending = true;
+    xSemaphoreGive(speechMutex);
 }
 
+#if 0 // Replaced by JSON API and static responsive UI in connections.h.
 void handleRoot() {
     server.send(200, "text/html",
                 "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width,initial-scale=1\">"
@@ -697,7 +838,8 @@ void handleRoot() {
                 "#status{color:#555}</style><h2>ESP32 OLED Chat</h2>"
                 "<p id=status>Nhan nut mic, cho phep microphone, roi noi tieng Viet.</p>"
                 "<form id=form><input id=text name=message autofocus placeholder=\"Nhap tin nhan\">"
-                "<button>Gui</button><button type=button id=mic>Mic</button></form>"
+                "<button>Gui</button><button type=button id=mic>Mic Trình Duyệt</button>"
+                "<button type=button id=hwmic onclick=\"status.textContent='ESP32 dang thu am 2 giay...';location.href='/listen'\">Mic INMP441</button></form>"
                 "<p>Ban: " + htmlEscape(lastMessage) + "</p><p>ESP32: " +
                     htmlEscape(lastReply) + "</p>"
                 "<script>"
@@ -797,8 +939,14 @@ void connectWiFi() {
     }
 }
 
+#endif
+#include "connections.h"
+
 void setup() {
     Serial.begin(115200);
+    speechMutex = xSemaphoreCreateMutex();
+    stoppedSignal = xSemaphoreCreateBinary();
+    if (!speechMutex || !stoppedSignal) { Serial.println("Audio semaphore allocation failed"); return; }
     delay(500);
     audioLogger = &Serial;
     Wire.begin(OLED_SDA, OLED_SCL);
@@ -806,36 +954,44 @@ void setup() {
     if (oledAddress == 0 ||
         !display.begin(SSD1306_SWITCHCAPVCC, oledAddress)) {
         Serial.println("OLED NOT FOUND/INIT FAILED.");
-        while (true) {
-            delay(1000);
-        }
+        lastError = "OLED khong tim thay; web van hoat dong";
+    } else {
+        oledReady = true;
     }
     setFace(Face::Neutral);
     testSpeaker();
     setupMicrophone();
-    connectWiFi();
-    speakText("Xin chao! Toi la robot Carevidssio.");
+    setupConnections();
+    pendingSpeech = "Xin chao! Toi la robot Carevision.";
+    speechPending = true;
     xTaskCreatePinnedToCore(audioPlaybackTask, "audioPlayback", 4096, nullptr,
                             1, nullptr, 1);
-    Serial.println("Nhap tin nhan trong Serial Monitor va nhan Enter.");
+    Serial.println("Nhap tin nhan trong Serial Monitor (go 'mic' de thu am, 'mictest' de do muc mic).");
 }
 
 void loop() {
-    if (WiFi.status() == WL_CONNECTED) {
-        server.handleClient();
-    }
+    server.handleClient();
+    pollConnections();
+    pollVoice();
     if (Serial.available()) {
         String input = Serial.readStringUntil('\n');
         input.trim();
-        if (input.equalsIgnoreCase("mic")) {
+        if (input.startsWith("key ")) {
+            String key = input.substring(4); key.trim();
+            if (key.length() >= 16 && key.length() <= 256 && key.indexOf('\r') < 0) {
+                if (preferences.putString("gemini", key)) { geminiKey = key; Serial.println("Gemini key saved to NVS (hidden)."); }
+                else Serial.println("NVS write failed.");
+            } else Serial.println("Invalid key length.");
+        } else if (input.equalsIgnoreCase("setup")) {
+            openSetup();
+        } else if (input.equalsIgnoreCase("mic")) {
             transcribeMicrophone();
-        } else {
-            handleChat(input);
+        } else if (input.equalsIgnoreCase("mictest")) {
+            checkMicrophoneLevel();
+        } else if (input.length() > 0) {
+            if (geminiKey.isEmpty()) handleChat(input);
+            else if (!askGemini(input)) Serial.println(lastError);
         }
-    }
-    if (millis() - lastMicrophoneCheck > 2000) {
-        lastMicrophoneCheck = millis();
-        checkMicrophoneLevel();
     }
     if (millis() - lastBlink > 4500) {
         lastBlink = millis();

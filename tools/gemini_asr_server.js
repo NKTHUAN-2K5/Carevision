@@ -36,21 +36,39 @@ async function transcribe(audio) {
   const endpoint =
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent` +
     `?key=${encodeURIComponent(apiKey)}`;
+  const wav = Buffer.alloc(44 + audio.length);
+  wav.write("RIFF", 0);
+  wav.writeUInt32LE(36 + audio.length, 4);
+  wav.write("WAVEfmt ", 8);
+  wav.writeUInt32LE(16, 16);
+  wav.writeUInt16LE(1, 20);
+  wav.writeUInt16LE(1, 22);
+  wav.writeUInt32LE(16000, 24);
+  wav.writeUInt32LE(32000, 28);
+  wav.writeUInt16LE(2, 32);
+  wav.writeUInt16LE(16, 34);
+  wav.write("data", 36);
+  wav.writeUInt32LE(audio.length, 40);
+  audio.copy(wav, 44);
   const requestBody = {
     contents: [{
       parts: [
         {
-          text: "Chuyen am thanh tieng Viet nay thanh van ban. Chi tra ve dung cau noi, khong giai thich.",
+          text:
+            "Nghe am thanh tieng Viet. Tra ve dung 2 dong:\n" +
+            "USER: <noi dung nguoi dung vua noi>\n" +
+            "AI: [cam_xuc:<nhan>] <cau tra loi ngan gon than thien duoi 20 tu>\n" +
+            "Trong do <nhan> thuoc: vui, buon, gian, batngo, yeu, so, phan_khich, binh_yen, boi_roi, xau_ho, tu_hao, co_don, hy_vong, biet_on, chan, lo_lang, nhe_nhom, to_mo, quyet_tam, dau, cuoi.",
         },
         {
           inline_data: {
-            mime_type: "audio/pcm;rate=16000",
-            data: audio.toString("base64"),
+            mime_type: "audio/wav",
+            data: wav.toString("base64"),
           },
         },
       ],
     }],
-    generationConfig: { temperature: 0 },
+    generationConfig: { temperature: 0.4 },
   };
   const response = await fetch(endpoint, {
     method: "POST",
@@ -61,14 +79,19 @@ async function transcribe(audio) {
   if (!response.ok) {
     throw new Error(result.error?.message || `Gemini HTTP ${response.status}`);
   }
-  const text = result.candidates?.[0]?.content?.parts
+  const raw = result.candidates?.[0]?.content?.parts
     ?.map((part) => part.text || "")
     .join("")
     .trim();
-  if (!text) {
+  if (!raw) {
     throw new Error("Gemini returned no transcript.");
   }
-  return text;
+  const userMatch = raw.match(/USER:\s*(.+)/i);
+  const aiMatch = raw.match(/AI:\s*(.+)/i);
+  return {
+    text: userMatch ? userMatch[1].trim() : raw,
+    reply: aiMatch ? aiMatch[1].trim() : "",
+  };
 }
 
 const server = http.createServer(async (request, response) => {
@@ -90,7 +113,8 @@ const server = http.createServer(async (request, response) => {
       sendJson(response, 400, { error: "Audio payload is empty." });
       return;
     }
-    sendJson(response, 200, { text: await transcribe(audio) });
+    const result = await transcribe(audio);
+    sendJson(response, 200, result);
   } catch (error) {
     console.error(error.message);
     sendJson(response, 502, { error: error.message });

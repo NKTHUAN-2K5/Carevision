@@ -1,5 +1,26 @@
 # OLED_TEST - ESP32 + OLED I2C
 
+## Giao diện và chế độ độc lập (bản cập nhật)
+
+### Nghe tự động
+
+Firmware hiện dùng `gemini-3.5-flash-lite`, mặc định bật nghe tự động. Web có nút bật/tắt. VAD năng lượng hiệu chỉnh nền ban đầu, bắt âm lượng tăng, kết thúc sau khoảng 0,72 giây yên lặng; giới hạn mỗi bản thu 3 giây, PCM16 8 kHz. Loa đang phát hoặc chế độ cấu hình đang mở thì không thu tự động. Mỗi lần gọi tự động cách nhau ít nhất 6 giây; vẫn có thể hết quota ngày, chưa có giới hạn ngày trong firmware. Đây không phải wake word: tiếng động lớn có thể kích hoạt nhầm. Chưa có bộ nhớ hội thoại nhiều lượt. Hạn chế RAM: bản thu ngắn và giảm mẫu để dành RAM cho TLS; nâng lên PSRAM/streaming khi cần câu dài. Server ASR dự phòng cũ cần chỉnh hỗ trợ 8 kHz trước khi dùng; ưu tiên Gemini trực tiếp.
+
+- Web mới: Trò chuyện, Kết nối, Chẩn đoán; mở IP in trong Serial (`Web: http://...`).
+- Khi có key trong NVS, mic trên mạch và chat web gọi Gemini trực tiếp qua HTTPS có xác minh chứng chỉ. Không cần server máy tính. Model hiện dùng `gemini-3.6-flash`; lỗi hạn mức/model/mạng được hiện trên web.
+- Nhập key qua USB Serial bằng lệnh `key YOUR_KEY` (115200 baud), hoặc giữ BOOT 2 giây, kết nối WiFi riêng `Carevision-Setup` bằng mật khẩu ngẫu nhiên in trên Serial, mở `http://192.168.4.1`, mục Chẩn đoán. Không gửi key qua WiFi công cộng. Key không được trả về API trạng thái; NVS chưa mã hóa nên không chống trích xuất vật lý.
+- BOOT giữ 2 giây mở cửa sổ cấu hình 120 giây: quét/đổi WiFi, đổi endpoint, ghép đôi BLE. WiFi chỉ lưu khi kết nối thành công; thất bại sau 20 giây thì thử khôi phục cấu hình cũ.
+- BLE `Carevision` có mã ghép đôi in Serial, chỉ nhận cấu hình trong cửa sổ BOOT. Hết cửa sổ mạch khởi động lại để thu hồi RAM Bluetooth trước khi gọi AI. Không truyền âm thanh Bluetooth.
+- BLE trên web và mic trình duyệt cần Chrome/Edge tương thích, HTTPS hoặc localhost. Safari/iPhone dùng cấu hình WiFi thay thế. Proxy tùy chọn: `python3 tools/chat_proxy.py --esp32 http://IP_ESP32`, mở `http://127.0.0.1:8080`.
+- Bấm **Mic trên mạch** để thu 2 giây, hoặc gõ `mic` qua Serial. Chưa nghe liên tục, chưa có wake word, chưa nhớ hội thoại nhiều lượt. Tin nhắn web giữ trong tab, mất khi tải lại.
+- Giọng nói vẫn dùng dịch vụ Google Translate TTS hiện có, phụ thuộc Internet; chưa bảo đảm dịch vụ này luôn khả dụng. Giới hạn hiện tại: trong lúc chờ HTTP AI, web đồng bộ chưa xử lý lệnh dừng; dừng loa sau khi yêu cầu hiện tại hoàn tất.
+- Không dùng endpoint web không xác thực trên mạng không tin cậy: token chống gửi chéo trang không phải đăng nhập người dùng. Cấu hình nhạy cảm còn yêu cầu cửa sổ BOOT; key web chỉ nhận qua AP riêng.
+- Partition `huge_app.csv` dành 3 MB cho firmware BLE + TLS; **không hỗ trợ OTA** trong bố cục này. NVS giữ nguyên vị trí; không cần xóa flash.
+
+Kiểm tra: `python3 tools/check_firmware.py`, `pio run`. Build không thay thế kiểm thử BLE, âm thanh, phục hồi WiFi và hội thoại trên mạch thật.
+
+Các mục server ASR bên dưới là chế độ cũ/dự phòng khi chưa có Gemini key trên mạch.
+
 ## Phần cứng mặc định
 - Board: ESP32 DevKit V1
 - OLED: SSD1306 128x64, I2C, địa chỉ 0x3C
